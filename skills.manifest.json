@@ -1,0 +1,42 @@
+{
+  "generated_by": "planning-studio",
+  "central_repo": "D:\\DEV\\ACTIVE\\.agents",
+  "skills": [
+    {
+      "slug": "smart-document-agent-conventions",
+      "bundle": "custom",
+      "reason": "يطابق FastAPI، Streamlit: هذه المهارة تحدد الاتفاقيات والمعايير الصارمة لتطوير نظام ولوحة تحكم ذكية لتحليل واستخراج وتعديل المستندات. يجب استخدامها دائمًا عند البدء",
+      "source": "custom"
+    },
+    {
+      "slug": "impeccable",
+      "bundle": "design-craft",
+      "reason": "يطابق i18n / RTL، Dashboard UI، UI / Visual design، Architecture: Use when the user wants to design, redesign, shape, critique, audit, polish, clarify, distill, harden, optimize, adapt, animate, colorize"
+    },
+    {
+      "slug": "developing-with-streamlit",
+      "bundle": "python-data",
+      "reason": "يطابق Streamlit، Dashboard UI، Build quality: **[REQUIRED]** Use for ALL Streamlit tasks: creating, editing, debugging, beautifying, styling, theming, or optimizing Streamlit"
+    },
+    {
+      "slug": "api-patterns",
+      "bundle": "core",
+      "reason": "يطابق REST / GraphQL API، UI / Visual design: Use when designing backend APIs — choosing between REST, GraphQL, or tRPC, structuring response envelopes, configuring pagination"
+    },
+    {
+      "slug": "database-design",
+      "bundle": "python-data",
+      "reason": "يطابق Database، Planning: Database design principles and decision-making. Schema design, indexing strategy, ORM selection, serverless databases.. Use: When designing"
+    },
+    {
+      "slug": "emil-break-ui",
+      "bundle": "design-craft",
+      "reason": "يطابق UI / Visual design: Try to break a piece of UI by feeding it worst-case data — long names, unbreakable emails, one-letter names, missing fields, huge counts"
+    },
+    {
+      "slug": "i18n-localization",
+      "bundle": "ui-ux-design",
+      "reason": "يطابق i18n / RTL: Internationalization and localization patterns. Detecting hardcoded strings, managing translations, locale files, RTL support.. Use: When"
+    }
+  ]
+}
