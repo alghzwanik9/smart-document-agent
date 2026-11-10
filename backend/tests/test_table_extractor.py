@@ -33,6 +33,15 @@ def odd_sheet(count=6) -> str:
     return "\n".join([ODD_TITLES, *rows])
 
 
+UNRESOLVABLE_TITLES = "Staff | Ref | Dept | Score | Level | Metric"
+UNRESOLVABLE_COLUMNS = ["employee_name", "employee_id", None, "net_salary", None, None]
+
+
+def unresolvable_sheet(count=6) -> str:
+    rows = [f"Person {n} | R{n:03d} | Ops | {5000 + n * 17} | 100 | 4000" for n in range(count)]
+    return "\n".join([UNRESOLVABLE_TITLES, *rows])
+
+
 def extractor_for(provider=None, **overrides) -> LLMExtractor:
     base = dict(llm_base_url="http://llm.test/v1", llm_model="test-model")
     client = httpx.Client(transport=httpx.MockTransport(provider or Provider()))
@@ -224,18 +233,19 @@ def test_every_sheet_of_a_workbook_is_read_and_a_layout_is_asked_about_once():
     provider = Provider(chat_reply({"columns": ODD_COLUMNS}))
     text = "\n".join(f"--- sheet: M{n} ---\n{odd_sheet(3)}" for n in range(12))
     drafts = extractor_for(provider).extract(text)
-    assert len(provider.requests) == 1
+    assert len(provider.requests) == 0
     assert len({d.record_index for d in drafts}) == 36
+    assert all(d.confidence >= 0.90 for d in drafts)
 
 
 # ---------------------------------------------------------------------- the extractor: one small question
 def test_unknown_titles_cost_one_small_request_and_every_row_is_read():
-    provider = Provider(chat_reply({"columns": ODD_COLUMNS}))
-    sheet = odd_sheet(200)
+    provider = Provider(chat_reply({"columns": UNRESOLVABLE_COLUMNS}))
+    sheet = unresolvable_sheet(200)
     drafts = extractor_for(provider).extract(sheet)
     assert len(provider.requests) == 1
     system, user = provider.requests[0]["body"]["messages"]
-    assert user["content"].startswith("<table>\n" + ODD_TITLES) and user["content"].endswith("\n</table>")
+    assert user["content"].startswith("<table>\n" + UNRESOLVABLE_TITLES) and user["content"].endswith("\n</table>")
     assert user["content"].count("\n") == 5 and "Person 4 " not in user["content"]      # titles and three rows only
     assert len(user["content"]) < len(sheet) / 20
     assert len({d.record_index for d in drafts}) == 200
@@ -243,48 +253,48 @@ def test_unknown_titles_cost_one_small_request_and_every_row_is_read():
 
 
 def test_a_layout_the_model_explained_is_never_asked_again():
-    layouts, provider = MemoryLayouts(), Provider(chat_reply({"columns": ODD_COLUMNS}))
+    layouts, provider = MemoryLayouts(), Provider(chat_reply({"columns": UNRESOLVABLE_COLUMNS}))
     extractor = extractor_for(provider)
-    extractor.extract(odd_sheet(), layouts=layouts)
-    extractor.extract(odd_sheet(9), layouts=layouts)
+    extractor.extract(unresolvable_sheet(), layouts=layouts)
+    extractor.extract(unresolvable_sheet(9), layouts=layouts)
     assert len(provider.requests) == 1 and layouts.uses == 1 and len(layouts.saved) == 1
 
 
 def test_a_stored_mapping_that_no_longer_reads_the_layout_is_dropped_and_asked_again():
     layouts = MemoryLayouts()
-    provider = Provider(chat_reply({"columns": ODD_COLUMNS}))
+    provider = Provider(chat_reply({"columns": UNRESOLVABLE_COLUMNS}))
     extractor = extractor_for(provider)
-    extractor.extract(odd_sheet(), layouts=layouts)
+    extractor.extract(unresolvable_sheet(), layouts=layouts)
     key = next(iter(layouts.saved))
-    layouts.saved[key] = ["employee_id", "employee_name", None, "net_salary", "allowances", "deductions", "basic_salary"]
-    provider.replies.append(chat_reply({"columns": ODD_COLUMNS}))
-    drafts = extractor.extract(odd_sheet(), layouts=layouts)
+    layouts.saved[key] = [None, None, None, "net_salary", None, "employee_name"]
+    provider.replies.append(chat_reply({"columns": UNRESOLVABLE_COLUMNS}))
+    drafts = extractor.extract(unresolvable_sheet(), layouts=layouts)
     assert layouts.discarded == 1 and len(provider.requests) == 2
     assert by_field(drafts)[(0, "employee_name")].value == "Person 0"
 
 
 def test_a_fenced_reply_is_accepted_and_a_wrong_one_gets_one_retry():
-    provider = Provider(chat_reply("```json\n" + json.dumps({"columns": ODD_COLUMNS[:3]}) + "\n```"),
-                        chat_reply({"columns": ODD_COLUMNS}))
-    drafts = extractor_for(provider).extract(odd_sheet())
+    provider = Provider(chat_reply("```json\n" + json.dumps({"columns": UNRESOLVABLE_COLUMNS[:3]}) + "\n```"),
+                        chat_reply({"columns": UNRESOLVABLE_COLUMNS}))
+    drafts = extractor_for(provider).extract(unresolvable_sheet())
     assert len(provider.requests) == 2 and "not valid" in provider.requests[1]["body"]["messages"][-1]["content"]
-    assert len(drafts) == 6 * 6
+    assert len(drafts) == 6 * 3
 
 
 def test_a_mapping_refused_twice_sends_the_whole_sheet_to_the_model_as_before():
-    record = {"employee_name": "Person 0", "net_salary": 5050}
+    record = {"employee_name": "Person 0", "net_salary": 5000}
     provider = Provider(chat_reply("nonsense"), chat_reply("still nonsense"), chat_reply({"records": [record]}))
-    drafts = extractor_for(provider).extract(odd_sheet(2))
+    drafts = extractor_for(provider).extract(unresolvable_sheet(2))
     assert len(provider.requests) == 3 and "<document>" in provider.requests[2]["body"]["messages"][1]["content"]
     assert by_field(drafts)[(0, "employee_name")].value == "Person 0"
 
 
 def test_a_mapping_that_reads_the_table_badly_is_not_trusted_and_nothing_is_stored():
     layouts = MemoryLayouts()
-    swapped = ["employee_id", "employee_name", None, "net_salary", "allowances", "deductions", "basic_salary"]
-    record = {"employee_name": "Person 0", "net_salary": 5050}
-    provider = Provider(chat_reply({"columns": swapped}), chat_reply({"records": [record]}))
-    drafts = extractor_for(provider).extract(odd_sheet(2), layouts=layouts)
+    bad_columns = [None, None, None, "net_salary", None, "employee_name"]
+    record = {"employee_name": "Person 0", "net_salary": 5000}
+    provider = Provider(chat_reply({"columns": bad_columns}), chat_reply({"records": [record]}))
+    drafts = extractor_for(provider).extract(unresolvable_sheet(2), layouts=layouts)
     assert layouts.saved == {} and len(provider.requests) == 2          # the question, then the whole sheet
     assert by_field(drafts)[(0, "employee_name")].value == "Person 0"
 
@@ -298,13 +308,13 @@ def test_a_table_that_holds_no_payroll_is_passed_over_and_the_payroll_table_is_s
 
 def test_unknown_titles_with_no_provider_configured_say_so():
     with pytest.raises(ExtractionError, match="not configured"):
-        extractor_for(llm_base_url="", llm_model="").extract(odd_sheet())
+        extractor_for(llm_base_url="", llm_model="").extract(unresolvable_sheet())
 
 
 def test_a_provider_that_fails_on_the_question_fails_the_document():
     provider = Provider(httpx.Response(503))
     with pytest.raises(ExtractionError, match="HTTP 503"):
-        extractor_for(provider).extract(odd_sheet())
+        extractor_for(provider).extract(unresolvable_sheet())
 
 
 def test_titles_cannot_close_the_table_block_or_carry_instructions_into_the_system_prompt():
@@ -381,4 +391,239 @@ def test_through_the_api_an_unknown_layout_is_asked_once_across_documents(settin
         for name in ("june.csv", "july.csv"):
             document_id = upload(client, name, samples.csv_bytes(rows)).json()["document_id"]
             assert client.get(f"/documents/{document_id}", headers=HEADERS).json()["status"] == "completed"
-    assert len(provider.requests) == 1
+            fields = client.get(f"/documents/{document_id}/extracted_fields", headers=HEADERS).json()
+            assert all(f["confidence"] >= 0.90 for f in fields)
+    assert len(provider.requests) == 0
+
+
+# ---------------------------------------------------------------------- code-first arithmetic & heuristics inference
+from document_processing.table_extractor import (
+    find_arithmetic_columns,
+    find_id_column,
+    find_name_column,
+    infer_mapping_by_arithmetic,
+)
+
+
+@pytest.mark.parametrize(
+    ("header", "rows", "expected_mapping"),
+    [
+        pytest.param(
+            ("C1", "C2", "C3", "C4"),
+            (
+                ("5000.00", "500.00", "200.00", "5300.00"),
+                ("6000.00", "1000.00", "500.00", "6500.00"),
+                ("4500.00", "300.00", "100.00", "4700.00"),
+            ),
+            {"basic_salary": 0, "allowances": 1, "deductions": 2, "net_salary": 3},
+            id="standard_order_basic_allow_deduct_net",
+        ),
+        pytest.param(
+            ("Net", "Basic", "Allow", "Deduct"),
+            (
+                ("5300.00", "5000.00", "500.00", "200.00"),
+                ("6500.00", "6000.00", "1000.00", "500.00"),
+                ("4700.00", "4500.00", "300.00", "100.00"),
+            ),
+            {"net_salary": 0, "basic_salary": 1, "allowances": 2, "deductions": 3},
+            id="permuted_net_first",
+        ),
+        pytest.param(
+            ("B", "D", "N"),
+            (
+                ("5000", "200", "4800"),
+                ("6000", "500", "5500"),
+                ("4500", "100", "4400"),
+            ),
+            {"basic_salary": 0, "deductions": 1, "net_salary": 2},
+            id="no_allowances_basic_deduct_net",
+        ),
+        pytest.param(
+            ("B", "A", "N"),
+            (
+                ("5000", "500", "5500"),
+                ("6000", "1000", "7000"),
+                ("4500", "300", "4800"),
+            ),
+            {"basic_salary": 0, "allowances": 1, "net_salary": 2},
+            id="no_deductions_basic_allow_net",
+        ),
+        pytest.param(
+            ("C1", "C2", "C3", "C4"),
+            (
+                ("5000.004", "500.002", "200.001", "5300.005"),
+                ("6000.002", "1000.001", "500.000", "6500.003"),
+                ("4500.001", "300.000", "100.000", "4700.001"),
+            ),
+            {"basic_salary": 0, "allowances": 1, "deductions": 2, "net_salary": 3},
+            id="tolerance_within_0_01",
+        ),
+    ],
+)
+def test_find_arithmetic_columns_permutations(header, rows, expected_mapping):
+    table = Table(header, rows)
+    assert find_arithmetic_columns(table) == expected_mapping
+
+
+@pytest.mark.parametrize(
+    ("header", "rows"),
+    [
+        pytest.param(
+            ("ColA", "ColB"),
+            (
+                ("5000.00", "5000.00"),
+                ("6200.50", "6200.50"),
+                ("4100.00", "4100.00"),
+            ),
+            id="two_identical_numeric_columns_basic_equals_net",
+        ),
+    ],
+)
+def test_find_arithmetic_columns_basic_equals_net(header, rows):
+    table = Table(header, rows)
+    mapping = find_arithmetic_columns(table)
+    assert mapping is not None
+    assert mapping.get("basic_salary") in (0, 1)
+    assert mapping.get("net_salary") in (0, 1)
+    assert mapping["basic_salary"] != mapping["net_salary"]
+    assert "allowances" not in mapping and "deductions" not in mapping
+
+
+@pytest.mark.parametrize(
+    ("header", "rows", "expected_index"),
+    [
+        pytest.param(
+            ("Code", "Full Name", "Department"),
+            (
+                ("E001", "Ahmed Ali Mohamed", "Operations"),
+                ("E002", "Sara Ibrahim Omar", "Human Resources"),
+                ("E003", "Khaled Abdullah Al-Sayed", "Engineering"),
+            ),
+            1,
+            id="english_multi_word_name_over_code_and_department",
+        ),
+        pytest.param(
+            ("الرقم", "القسم", "الاسم الكامل"),
+            (
+                ("101", "تقنية المعلومات", "محمد عبد الرحمن علي"),
+                ("102", "المالية والمحاسبة", "فاطمة حسن إبراهيم"),
+                ("103", "الموارد البشرية", "عبد الله سعيد الغامدي"),
+            ),
+            2,
+            id="arabic_multi_word_name_over_code_and_department",
+        ),
+    ],
+)
+def test_find_name_column_heuristics(header, rows, expected_index):
+    table = Table(header, rows)
+    assert find_name_column(table) == expected_index
+
+
+@pytest.mark.parametrize(
+    ("header", "rows", "exclude", "expected_index"),
+    [
+        pytest.param(
+            ("EMP_CODE", "Status", "Site"),
+            (
+                ("EMP-001", "Active", "Riyadh"),
+                ("EMP-002", "Active", "Jeddah"),
+                ("EMP-003", "Active", "Dammam"),
+            ),
+            set(),
+            0,
+            id="alphanumeric_unique_code_as_id",
+        ),
+        pytest.param(
+            ("Seq", "National_ID", "Dept"),
+            (
+                ("1", "1098765432", "Finance"),
+                ("2", "1098765433", "Finance"),
+                ("3", "1098765434", "Marketing"),
+            ),
+            {0},
+            1,
+            id="high_cardinality_id_excluding_seq",
+        ),
+    ],
+)
+def test_find_id_column_heuristics(header, rows, exclude, expected_index):
+    table = Table(header, rows)
+    assert find_id_column(table, exclude_indices=exclude) == expected_index
+
+
+@pytest.mark.parametrize(
+    ("header", "rows"),
+    [
+        pytest.param(
+            ("Item", "Qty", "UnitPrice", "Total"),
+            (
+                ("Widget A", "10", "25.00", "250.00"),
+                ("Widget B", "5", "50.00", "250.00"),
+                ("Widget C", "2", "100.00", "200.00"),
+            ),
+            id="multiplication_invoice_fails_payroll_equation",
+        ),
+        pytest.param(
+            ("A", "B", "C"),
+            (
+                ("100", "200", "800"),
+                ("300", "400", "1900"),
+                ("500", "600", "3100"),
+            ),
+            id="random_numbers_fail_equation",
+        ),
+    ],
+)
+def test_find_arithmetic_columns_fallback_unmatched(header, rows):
+    table = Table(header, rows)
+    assert find_arithmetic_columns(table) is None
+
+
+@pytest.mark.parametrize(
+    ("header", "rows", "expected_mapping"),
+    [
+        pytest.param(
+            ("Col1", "Col2", "Col3", "Col4", "Col5", "Col6"),
+            (
+                ("EMP-01", "Ahmed Ali", "5000", "500", "200", "5300"),
+                ("EMP-02", "Sara Omar", "6000", "1000", "500", "6500"),
+                ("EMP-03", "Zaid Hasan", "4500", "300", "100", "4700"),
+            ),
+            ["employee_id", "employee_name", "basic_salary", "allowances", "deductions", "net_salary"],
+            id="full_equation_six_columns",
+        ),
+        pytest.param(
+            ("حقل1", "حقل2", "حقل3", "حقل4", "حقل5"),
+            (
+                ("أحمد علي حسن", "EMP-101", "6000", "500", "5500"),
+                ("سارة إبراهيم عمر", "EMP-102", "7000", "700", "6300"),
+                ("خالد عبد الله", "EMP-103", "5000", "200", "4800"),
+            ),
+            ["employee_name", "employee_id", "basic_salary", "deductions", "net_salary"],
+            id="arabic_name_id_basic_deduct_net",
+        ),
+        pytest.param(
+            ("X1", "X2", "X3", "X4"),
+            (
+                ("Tariq Aziz", "USR-99", "8000", "8000"),
+                ("Mona Saleh", "USR-98", "9500", "9500"),
+                ("Huda Karim", "USR-97", "7200", "7200"),
+            ),
+            ["employee_name", "employee_id", "basic_salary", "net_salary"],
+            id="basic_equals_net_no_extras",
+        ),
+        pytest.param(
+            ("ColA", "ColB", "ColC", "ColD"),
+            (
+                ("Item 1", "10", "20", "200"),
+                ("Item 2", "5", "50", "250"),
+                ("Item 3", "2", "100", "200"),
+            ),
+            None,
+            id="fallback_to_none_when_arithmetic_fails",
+        ),
+    ],
+)
+def test_infer_mapping_by_arithmetic_end_to_end(header, rows, expected_mapping):
+    table = Table(header, rows)
+    assert infer_mapping_by_arithmetic(table) == expected_mapping

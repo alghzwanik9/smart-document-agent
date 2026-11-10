@@ -10,9 +10,11 @@ tables pdfplumber finds in a PDF page). A scanned page or free text has none, an
 from __future__ import annotations
 
 import hashlib
+import itertools
 import re
 import unicodedata
 from dataclasses import dataclass
+from typing import Any, Sequence
 
 from core.schemas import AMOUNT_FIELDS, PAYROLL_FIELDS, PayrollRecord, parse_amount
 
@@ -198,3 +200,326 @@ def plausible(records: list[PayrollRecord]) -> bool:
         return False
     checked = [verdict for verdict in (arithmetic_holds(r) for r in records) if verdict is not None]
     return not checked or sum(checked) / len(checked) >= MIN_SHARE
+
+
+# ---------------------------------------------------------------------- code-first arithmetic & heuristics inference
+def _parse_number(val: Any) -> float | None:
+    """Parses a cell value to float, handling currencies, commas, trailing minus, parentheses, and spaces."""
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    text = str(val).strip()
+    if not text:
+        return None
+    if not re.search(r"[0-9٠-٩۰-۹]", text):
+        return None
+    try:
+        res = parse_amount(text)
+        if res is not None:
+            return res
+    except ValueError:
+        pass
+
+    t = text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫", "01234567890123456789."))
+    is_neg = False
+    if t.startswith("(") and t.endswith(")"):
+        is_neg = True
+        t = t[1:-1].strip()
+    elif t.endswith("-"):
+        is_neg = True
+        t = t[:-1].strip()
+    elif t.startswith("-"):
+        is_neg = True
+        t = t[1:].strip()
+
+    t = re.sub(r"(?i)^(?:SAR|USD|EUR|EGP|AED|KWD|QAR|BHD|OMR|ر\.?س|ج\.?م|د\.?إ|[\$€£¥₹])\s*", "", t).strip()
+    t = re.sub(r"(?i)\s*(?:SAR|USD|EUR|EGP|AED|KWD|QAR|BHD|OMR|ر\.?س|ج\.?م|د\.?إ|[\$€£¥₹])$", "", t).strip()
+    t = re.sub(r"[,  ٬]", "", t)
+
+    if re.fullmatch(r"\d+(?:\.\d+)?", t):
+        try:
+            num = float(t)
+            return -num if is_neg else num
+        except ValueError:
+            return None
+    return None
+
+
+def find_arithmetic_columns(
+    table_or_rows: Table | Sequence[Sequence[Any]],
+    tolerance: float = ARITHMETIC_TOLERANCE,
+) -> dict[str, int] | None:
+    """Finds numeric columns satisfying basic + allowances - deductions = net (or partial subsets)."""
+    if isinstance(table_or_rows, Table):
+        rows = table_or_rows.rows
+    else:
+        rows = table_or_rows
+
+    if not rows:
+        return None
+
+    num_cols = max(len(r) for r in rows) if rows else 0
+    if num_cols < 2:
+        return None
+
+    col_numbers: list[list[float | None]] = []
+    candidate_cols: list[int] = []
+    for c in range(num_cols):
+        vals = [_parse_number(r[c]) if c < len(r) else None for r in rows]
+        valid_count = sum(1 for v in vals if v is not None)
+        if valid_count >= len(rows) * MIN_SHARE and valid_count > 0:
+            candidate_cols.append(c)
+        col_numbers.append(vals)
+
+    if len(candidate_cols) < 2:
+        return None
+
+    # 1. 4 columns: basic + allowances - deductions = net
+    if len(candidate_cols) >= 4:
+        best_cand = None
+        best_score = -1
+        for b, a, d, n in itertools.permutations(candidate_cols, 4):
+            match_count = 0
+            valid_count = 0
+            for row_idx in range(len(rows)):
+                vb = col_numbers[b][row_idx]
+                va = col_numbers[a][row_idx]
+                vd = col_numbers[d][row_idx]
+                vn = col_numbers[n][row_idx]
+                if vb is not None and va is not None and vd is not None and vn is not None:
+                    valid_count += 1
+                    if abs((vb + va - vd) - vn) <= tolerance:
+                        match_count += 1
+            if valid_count >= len(rows) * MIN_SHARE and match_count >= valid_count * MIN_SHARE:
+                mean_b = sum(col_numbers[b][i] for i in range(len(rows)) if col_numbers[b][i] is not None)
+                mean_a = sum(col_numbers[a][i] for i in range(len(rows)) if col_numbers[a][i] is not None)
+                mean_d = sum(col_numbers[d][i] for i in range(len(rows)) if col_numbers[d][i] is not None)
+                mean_n = sum(col_numbers[n][i] for i in range(len(rows)) if col_numbers[n][i] is not None)
+                if mean_d < mean_b and mean_d < mean_n and mean_a < mean_b:
+                    edge_bonus = 2 if (n == 0 or n == max(candidate_cols)) else 0
+                    score = match_count * 10 + edge_bonus
+                    if score > best_score:
+                        real_b, real_a = (b, a) if mean_b >= mean_a else (a, b)
+                        best_score = score
+                        best_cand = {"basic_salary": real_b, "allowances": real_a, "deductions": d, "net_salary": n}
+        if best_cand is not None:
+            return best_cand
+
+    # 2. 3 columns:
+    if len(candidate_cols) >= 3:
+        best_cand = None
+        best_score = -1
+        for c1, c2, c3 in itertools.permutations(candidate_cols, 3):
+            for is_allowance in (True, False):
+                match_count = 0
+                valid_count = 0
+                for row_idx in range(len(rows)):
+                    v1 = col_numbers[c1][row_idx]
+                    v2 = col_numbers[c2][row_idx]
+                    v3 = col_numbers[c3][row_idx]
+                    if v1 is not None and v2 is not None and v3 is not None:
+                        valid_count += 1
+                        expected = (v1 + v2) if is_allowance else (v1 - v2)
+                        if abs(expected - v3) <= tolerance:
+                            match_count += 1
+                if valid_count >= len(rows) * MIN_SHARE and match_count >= valid_count * MIN_SHARE:
+                    mean_1 = sum(col_numbers[c1][i] for i in range(len(rows)) if col_numbers[c1][i] is not None)
+                    mean_2 = sum(col_numbers[c2][i] for i in range(len(rows)) if col_numbers[c2][i] is not None)
+                    mean_3 = sum(col_numbers[c3][i] for i in range(len(rows)) if col_numbers[c3][i] is not None)
+                    if mean_2 < mean_1 and (is_allowance or mean_2 < mean_3):
+                        edge_bonus = 2 if (c3 == 0 or c3 == max(candidate_cols)) else 0
+                        score = match_count * 10 + edge_bonus
+                        if score > best_score:
+                            best_score = score
+                            if is_allowance:
+                                best_cand = {"basic_salary": c1, "allowances": c2, "net_salary": c3}
+                            else:
+                                best_cand = {"basic_salary": c1, "deductions": c2, "net_salary": c3}
+        if best_cand is not None:
+            return best_cand
+
+    # 3. 2 columns: basic == net
+    for c1, c2 in itertools.combinations(candidate_cols, 2):
+        match_count = 0
+        valid_count = 0
+        for row_idx in range(len(rows)):
+            v1 = col_numbers[c1][row_idx]
+            v2 = col_numbers[c2][row_idx]
+            if v1 is not None and v2 is not None:
+                valid_count += 1
+                if abs(v1 - v2) <= tolerance:
+                    match_count += 1
+        if valid_count >= len(rows) * MIN_SHARE and match_count >= valid_count * MIN_SHARE and match_count > 0:
+            mean_v = sum(col_numbers[c1][i] for i in range(len(rows)) if col_numbers[c1][i] is not None)
+            if mean_v > 0:
+                return {"basic_salary": c1, "net_salary": c2}
+
+    return None
+
+
+def find_name_column(
+    table_or_headers: Table | Sequence[str],
+    rows_or_exclude: Sequence[Sequence[Any]] | set[int] | None = None,
+    exclude_indices: set[int] | None = None,
+) -> int | None:
+    """Finds the employee_name column using word count, alphabetic density, and uniqueness."""
+    if isinstance(table_or_headers, Table):
+        headers = table_or_headers.header
+        rows = table_or_headers.rows
+        exclude = rows_or_exclude if isinstance(rows_or_exclude, (set, frozenset)) else (exclude_indices or set())
+    else:
+        headers = tuple(table_or_headers)
+        rows = rows_or_exclude if isinstance(rows_or_exclude, (list, tuple)) else ()
+        exclude = exclude_indices or set()
+
+    if not rows:
+        return None
+
+    num_cols = max(len(r) for r in rows)
+    best_col = None
+    best_score = -1.0
+
+    for c in range(num_cols):
+        if c in exclude:
+            continue
+        cells = [str(r[c]).strip() for r in rows if c < len(r) and str(r[c]).strip()]
+        if not cells:
+            continue
+
+        num_numeric = sum(1 for cell in cells if _parse_number(cell) is not None)
+        if num_numeric / len(cells) >= 0.5:
+            continue
+
+        alpha_ratios = []
+        word_counts = []
+        for cell in cells:
+            letters = sum(1 for ch in cell if unicodedata.category(ch).startswith("L"))
+            alpha_ratios.append(letters / len(cell) if cell else 0.0)
+            words = [w for w in re.split(r"\s+", cell) if re.search(r"[\u0621-\u064Aa-zA-Z]", w)]
+            word_counts.append(len(words))
+
+        avg_alpha = sum(alpha_ratios) / len(alpha_ratios) if alpha_ratios else 0.0
+        if avg_alpha < 0.3:
+            continue
+
+        avg_words = sum(word_counts) / len(word_counts) if word_counts else 0.0
+        unique_ratio = len(set(cells)) / len(cells)
+
+        score = avg_words * 3.0 + avg_alpha * 2.0 + unique_ratio * 1.5
+        if score > best_score:
+            best_score = score
+            best_col = c
+
+    return best_col
+
+
+def find_id_column(
+    table_or_headers: Table | Sequence[str],
+    rows_or_exclude: Sequence[Sequence[Any]] | set[int] | None = None,
+    exclude_indices: set[int] | None = None,
+) -> int | None:
+    """Finds the employee_id column using uniqueness ratio, code patterns, and non-monetary distribution."""
+    if isinstance(table_or_headers, Table):
+        headers = table_or_headers.header
+        rows = table_or_headers.rows
+        exclude = rows_or_exclude if isinstance(rows_or_exclude, (set, frozenset)) else (exclude_indices or set())
+    else:
+        headers = tuple(table_or_headers)
+        rows = rows_or_exclude if isinstance(rows_or_exclude, (list, tuple)) else ()
+        exclude = exclude_indices or set()
+
+    if not rows:
+        return None
+
+    num_cols = max(len(r) for r in rows)
+    best_col = None
+    best_score = -1.0
+
+    for c in range(num_cols):
+        if c in exclude:
+            continue
+        cells = [str(r[c]).strip() for r in rows if c < len(r) and str(r[c]).strip()]
+        if not cells:
+            continue
+
+        unique_ratio = len(set(cells)) / len(cells)
+        if unique_ratio < 0.7:
+            continue
+
+        avg_words = sum(len(cell.split()) for cell in cells) / len(cells)
+        if avg_words > 1.5:
+            continue
+
+        is_seq = False
+        try:
+            int_vals = [int(cell) for cell in cells]
+            if len(int_vals) > 1 and all(int_vals[i] == int_vals[0] + i for i in range(len(int_vals))):
+                if int_vals[0] in (0, 1):
+                    is_seq = True
+        except ValueError:
+            pass
+
+        has_alphanumeric = any(re.search(r"[A-Za-z\u0621-\u064A]", cell) and re.search(r"\d", cell) for cell in cells)
+        has_digits = all(re.search(r"\d", cell) for cell in cells)
+        has_decimals = any("." in cell and re.search(r"\.\d{2}", cell) for cell in cells)
+
+        score = unique_ratio * 4.0
+        if has_alphanumeric:
+            score += 5.0
+        elif has_digits:
+            score += 3.0
+        if is_seq:
+            score -= 5.0
+        if has_decimals:
+            score -= 3.0
+
+        if score > best_score:
+            best_score = score
+            best_col = c
+
+    return best_col
+
+
+def infer_mapping_by_arithmetic(
+    table_or_headers: Table | Sequence[str],
+    rows: Sequence[Sequence[Any]] | None = None,
+) -> Mapping | None:
+    """Infers table mapping by solving payroll arithmetic and applying name/id heuristics."""
+    if isinstance(table_or_headers, Table):
+        headers = table_or_headers.header
+        table_rows = table_or_headers.rows
+        table = table_or_headers
+    else:
+        headers = tuple(table_or_headers)
+        table_rows = tuple(tuple(str(c) for c in r) for r in (rows or []))
+        table = Table(headers, table_rows)
+
+    if not table_rows:
+        return None
+
+    arithmetic_cols = find_arithmetic_columns(table)
+    if not arithmetic_cols:
+        return None
+
+    assigned: set[int] = set(arithmetic_cols.values())
+    mapping: Mapping = [None] * len(headers)
+
+    for field, idx in arithmetic_cols.items():
+        if idx < len(mapping):
+            mapping[idx] = field
+
+    name_idx = find_name_column(table, exclude_indices=assigned)
+    if name_idx is not None and name_idx < len(mapping):
+        mapping[name_idx] = "employee_name"
+        assigned.add(name_idx)
+
+    id_idx = find_id_column(table, exclude_indices=assigned)
+    if id_idx is not None and id_idx < len(mapping):
+        mapping[id_idx] = "employee_id"
+        assigned.add(id_idx)
+
+    if not sufficient(mapping):
+        return None
+
+    return mapping

@@ -19,8 +19,8 @@ from core.schemas import (AMOUNT_FIELDS, PAYROLL_FIELDS, FieldDraft, LearnedCorr
                           PayrollRecord, format_amount)
 from document_processing import ProcessingError
 from document_processing.table_extractor import (Mapping, Table, arithmetic_holds, build_records, find_tables,
-                                                 fingerprint, map_by_synonyms, plausible, sample, sufficient,
-                                                 valid_mapping)
+                                                 fingerprint, infer_mapping_by_arithmetic, map_by_synonyms, plausible,
+                                                 sample, sufficient, valid_mapping)
 
 log = logging.getLogger("document_processing.llm_extractor")
 
@@ -100,7 +100,7 @@ class LLMExtractor:
         """The employees of every payroll table in the text. A table that holds no payroll is passed over; one that
         looks like payroll but cannot be read with confidence raises `_Unusable`, so no employee is silently dropped."""
         known: dict[str, tuple[Mapping | None, bool]] = {}
-        sources = {"titles": 0, "stored": 0, "model": 0}
+        sources = {"titles": 0, "stored": 0, "arithmetic": 0, "model": 0}
         records: list[PayrollRecord] = []
         for table in find_tables(text):
             key = fingerprint(table.header)
@@ -114,8 +114,8 @@ class LLMExtractor:
                 raise _Unusable
             records.extend(rows)
         if records:
-            log.info("Read %s payroll records from tables (layouts matched by titles: %s, stored: %s, asked of the model: %s)",
-                     len(records), sources["titles"], sources["stored"], sources["model"])
+            log.info("Read %s payroll records from tables (layouts matched by titles: %s, stored: %s, arithmetic: %s, asked of the model: %s)",
+                     len(records), sources["titles"], sources["stored"], sources["arithmetic"], sources["model"])
         return records
 
     def _column_mapping(self, table: Table, key: str, layouts, sources: dict) -> tuple[Mapping | None, bool]:
@@ -133,6 +133,14 @@ class LLMExtractor:
                 sources["stored"] += 1
                 return stored, False
             layouts.discard(key)        # it no longer reads this layout well: ask again
+        inferred = infer_mapping_by_arithmetic(table.header, table.rows)
+        if inferred is not None and sufficient(inferred):
+            inferred_rows = build_records(table, inferred)
+            if plausible(inferred_rows):
+                sources["arithmetic"] = sources.get("arithmetic", 0) + 1
+                if layouts:
+                    layouts.put(key, inferred)
+                return inferred, True
         asked = self._ask_columns(table)
         if asked is None or not sufficient(asked):
             return None, False
