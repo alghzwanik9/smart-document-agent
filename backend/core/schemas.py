@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -63,10 +63,23 @@ class PayrollRecord(BaseModel):
         return parse_amount(value)
 
 
+class ValidationWarning(BaseModel):
+    """A data quality or deterministic validation warning flagged during extraction."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    warning_type: str
+    message: str
+    record_index: int | None = None
+    field_name: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class PayrollExtraction(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     records: list[PayrollRecord] = Field(default_factory=list)
+    warnings: list[ValidationWarning] = Field(default_factory=list)
 
 
 PAYROLL_FIELDS = tuple(PayrollRecord.model_fields)
@@ -108,6 +121,7 @@ class UploadAccepted(BaseModel):
 
 class FieldCorrection(BaseModel):
     corrected_value: str = Field(max_length=500)
+    reason: str | None = Field(default=None, max_length=500)
 
 
 class ExtractedFieldOut(BaseModel):
@@ -160,3 +174,135 @@ class AnalyticsSummary(BaseModel):
     average_confidence: float | None = None
     corrections_total: int
     corrected_by_field: dict[str, int]
+
+
+# ---------------------------------------------------------------------- Yahya Intelligent Office System Schemas
+class PersonCreate(BaseModel):
+    employee_number: str | None = None
+    full_name: str
+    national_id: str | None = None
+
+
+class PersonOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    per_id: str
+    employee_number: str | None = None
+    full_name: str
+    created_at: datetime
+
+
+class CaseEventCreateRequest(BaseModel):
+    event_type: str = "COMMENT"
+    description: str
+    old_value: str | None = None
+    new_value: str | None = None
+    reason: str | None = None
+
+
+class CaseEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    case_id: str
+    ev_id: str
+    event_type: str
+    description: str
+    old_value: str | None = None
+    new_value: str | None = None
+    reason: str | None = None
+    created_at: datetime
+
+
+class CaseRelationCreateRequest(BaseModel):
+    target_case_id: str
+    relation_type: str
+
+
+class CaseRelationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    source_case_id: str
+    target_case_id: str
+    relation_type: str
+    created_at: datetime
+
+
+class CaseCreateRequest(BaseModel):
+    per_id: str | None = None
+    employee_number: str | None = None
+    full_name: str | None = None
+    national_id: str | None = None
+    subject: str
+    domain: str = "PAY"
+    priority: str = "P2"
+    statutory_deadline: datetime | None = None
+    reference_number: str | None = None
+    monetary_amount: float | None = None
+    document_id: int | None = None
+    initial_event_description: str | None = None
+
+
+class CaseOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    case_id: str
+    per_id: str
+    subject: str
+    domain: str
+    status: str
+    priority: str
+    statutory_deadline: datetime | None = None
+    close_reason: str | None = None
+    document_id: int | None = None
+    reference_number: str | None = None
+    monetary_amount: float | None = None
+    created_at: datetime
+
+
+class CaseDetailOut(CaseOut):
+    person: PersonOut | None = None
+    events: list[CaseEventOut] = Field(default_factory=list)
+    outgoing_relations: list[CaseRelationOut] = Field(default_factory=list)
+    incoming_relations: list[CaseRelationOut] = Field(default_factory=list)
+
+
+class IntakeEvaluationRequest(BaseModel):
+    employee_number: str | None = None
+    full_name: str
+    national_id: str | None = None
+    subject: str
+    reference_number: str | None = None
+    monetary_amount: float | None = None
+    statutory_deadline: datetime | None = None
+    domain: str = "PAY"
+    document_id: int | None = None
+
+
+class SimilarCaseSummary(BaseModel):
+    case_id: str
+    subject: str
+    per_id: str
+    status: str
+    last_event: str | None = None
+    matched_fields: list[str] = Field(default_factory=list)
+    differences: list[str] = Field(default_factory=list)
+
+
+class IntakeEvaluationResult(BaseModel):
+    decision: Literal["NO_MATCH", "SIMILAR_FOUND", "SAME_PERSON_NEW_TOPIC"]
+    suggested_priority: str
+    business_days_remaining: int | None = None
+    person: PersonOut | None = None
+    similar_cases: list[SimilarCaseSummary] = Field(default_factory=list)
+    reason: str
+
+
+class YahyaHierarchyOut(BaseModel):
+    per_id: str
+    employee_number: str | None = None
+    full_name: str
+    created_at: datetime
+    cases: list[CaseDetailOut] = Field(default_factory=list)
+

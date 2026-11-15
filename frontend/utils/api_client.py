@@ -84,6 +84,26 @@ class ApiClient:
                       media_type=response.headers.get("Content-Type", "application/octet-stream"),
                       unplaced=[int(item) for item in unplaced.split(",") if item.strip().isdigit()])
 
+    # ------------------------------------------------------------------ Yahya Intelligent Office System
+    def evaluate_intake(self, payload: dict) -> dict:
+        return self._request("POST", "/yahya/intake/evaluate", json=payload).json()
+
+    def create_case(self, payload: dict) -> dict:
+        return self._request("POST", "/yahya/cases", json=payload).json()
+
+    def get_case(self, case_id: str) -> dict:
+        return self._request("GET", f"/yahya/cases/{case_id}").json()
+
+    def add_case_event(self, case_id: str, payload: dict) -> dict:
+        return self._request("POST", f"/yahya/cases/{case_id}/events", json=payload).json()
+
+    def search_yahya(self, query: str) -> list[dict]:
+        return self._request("GET", "/yahya/search", params={"q": query}).json()
+
+    def export_yahya_sync(self, format: str = "json") -> httpx.Response:
+        return self._request("GET", "/yahya/sync-export", params={"format": format})
+
+
 
 @dataclass
 class Export:

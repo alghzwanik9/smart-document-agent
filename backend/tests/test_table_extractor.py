@@ -9,13 +9,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from core.config import Settings, load_settings
-from core.schemas import PayrollRecord
+from core.schemas import PayrollExtraction, PayrollRecord, ValidationWarning
 from database.connection import Database
 from document_processing import parse_document
 from document_processing.layout_store import LayoutStore
-from document_processing.llm_extractor import ExtractionError, LLMExtractor
-from document_processing.table_extractor import (Table, build_records, fingerprint, find_tables, map_by_synonyms,
-                                                 plausible, sample, sufficient, valid_mapping)
+from document_processing.llm_extractor import ExtractionError, LLMExtractor, score_records
+from document_processing.table_extractor import (ARITHMETIC_TOLERANCE, Table, build_records,
+                                                 check_arithmetic_discrepancy, check_duplicate_ids,
+                                                 check_salary_outliers, fingerprint, find_tables,
+                                                 map_by_fuzzy_headers, map_by_synonyms, plausible,
+                                                 run_deterministic_quality_checks, sample, sufficient,
+                                                 valid_mapping, validate_payroll_data)
 from main import create_app
 from tests import samples
 from tests.conftest import API_KEY, HEADERS
@@ -627,3 +631,301 @@ def test_find_arithmetic_columns_fallback_unmatched(header, rows):
 def test_infer_mapping_by_arithmetic_end_to_end(header, rows, expected_mapping):
     table = Table(header, rows)
     assert infer_mapping_by_arithmetic(table) == expected_mapping
+
+
+# ---------------------------------------------------------------------- fuzzy header matching (RapidFuzz)
+@pytest.mark.parametrize(
+    ("header", "expected_mapping"),
+    [
+        pytest.param(
+            ("اسم الموظفين", "كود الموظف", "الراتب الأساسى", "البدلات", "الاستقطاعات", "صافى المستحق"),
+            ["employee_name", "employee_id", "basic_salary", "allowances", "deductions", "net_salary"],
+            id="arabic_plural_typo_alef_maksura",
+        ),
+        pytest.param(
+            ("الموظف", "الرقم الوظيفى", "راتب اساسي", "بدل", "خصم", "الصافي"),
+            ["employee_name", "employee_id", "basic_salary", "allowances", "deductions", "net_salary"],
+            id="arabic_singular_synonyms",
+        ),
+        pytest.param(
+            ("اسم العامل", "رقم العامل", "اساسي", "اجمالي البدلات", "اجمالي الخصومات", "صافي مستحق"),
+            ["employee_name", "employee_id", "basic_salary", "allowances", "deductions", "net_salary"],
+            id="arabic_worker_and_totals",
+        ),
+        pytest.param(
+            ("اسم الموظف", "كود العامل", "الراتب الاساسي", "خصميات", "صافي الراتب"),
+            ["employee_name", "employee_id", "basic_salary", "deductions", "net_salary"],
+            id="arabic_khusumiyat_and_code",
+        ),
+    ],
+)
+def test_map_by_fuzzy_headers_arabic_variants(header, expected_mapping):
+    assert map_by_fuzzy_headers(header) == expected_mapping
+
+
+@pytest.mark.parametrize(
+    ("header", "expected_mapping"),
+    [
+        pytest.param(
+            ("Emplyee Name", "Emp No", "Basik Salary", "Allw", "Deduct", "Net Pay"),
+            ["employee_name", "employee_id", "basic_salary", "allowances", "deductions", "net_salary"],
+            id="english_typos_and_abbreviations",
+        ),
+        pytest.param(
+            ("Full Name", "Staff ID", "Base Salary", "Total Allowances", "Total Deductions", "Take Home"),
+            ["employee_name", "employee_id", "basic_salary", "allowances", "deductions", "net_salary"],
+            id="english_standard_variants",
+        ),
+        pytest.param(
+            ("Staff Name", "Employee Code", "Basic Sal", "Allow", "Deductions", "Net Amount"),
+            ["employee_name", "employee_id", "basic_salary", "allowances", "deductions", "net_salary"],
+            id="english_staff_code_sal",
+        ),
+        pytest.param(
+            ("Worker Name", "Staff No", "Base Pay", "Net"),
+            ["employee_name", "employee_id", "basic_salary", "net_salary"],
+            id="english_worker_base_pay",
+        ),
+    ],
+)
+def test_map_by_fuzzy_headers_english_variants(header, expected_mapping):
+    assert map_by_fuzzy_headers(header) == expected_mapping
+
+
+@pytest.mark.parametrize(
+    "unrelated_header",
+    [
+        ("Department", "Notes", "Bank", "Score", "Level", "Metric", "Status", "Branch", "Project", "Dept"),
+        ("القسم", "الملاحظات", "البنك", "المستوى", "الدرجة", "الفرع", "المشروع", "الحالة"),
+    ],
+)
+def test_map_by_fuzzy_headers_unrelated_rejection(unrelated_header):
+    mapping = map_by_fuzzy_headers(unrelated_header)
+    assert mapping == [None] * len(unrelated_header)
+
+
+def test_map_by_fuzzy_headers_strict_threshold_boundary():
+    # 'employ' vs 'employee' has ratio ~85.7: passes threshold 82.0, fails 90.0
+    assert map_by_fuzzy_headers(("employ",), threshold=82.0) == ["employee_name"]
+    assert map_by_fuzzy_headers(("employ",), threshold=90.0) == [None]
+
+    # 'emplo' vs 'employee' has ratio ~76.9: fails threshold 82.0, passes 70.0
+    assert map_by_fuzzy_headers(("emplo",), threshold=82.0) == [None]
+    assert map_by_fuzzy_headers(("emplo",), threshold=70.0) == ["employee_name"]
+
+    # 'bask salary' vs 'base salary' has ratio ~90.9: passes 82.0, fails 92.0
+    assert map_by_fuzzy_headers(("bask salary",), threshold=82.0) == ["basic_salary"]
+    assert map_by_fuzzy_headers(("bask salary",), threshold=92.0) == [None]
+
+    # 'bazz salary' vs 'basic salary' has ratio ~78.3: fails 82.0
+    assert map_by_fuzzy_headers(("bazz salary",), threshold=82.0) == [None]
+
+
+def test_map_by_fuzzy_headers_greedy_assignment():
+    # If two columns resemble the same field, highest score wins and second column gets None
+    mapping = map_by_fuzzy_headers(("Basic Salary", "Basik Salary", "Net Pay"))
+    assert mapping == ["basic_salary", None, "net_salary"]
+
+    # Permuted column ordering maintains correct mapping
+    permuted = ("Net Pay", "Deduct", "Allw", "Basik Salary", "Emp No", "Emplyee Name")
+    expected = ["net_salary", "deductions", "allowances", "basic_salary", "employee_id", "employee_name"]
+    assert map_by_fuzzy_headers(permuted) == expected
+
+    # Interspersed unrelated columns remain None
+    mixed = ("Dept", "Emplyee Name", "Notes", "Basik Salary", "Score", "Net Pay")
+    assert map_by_fuzzy_headers(mixed) == [None, "employee_name", None, "basic_salary", None, "net_salary"]
+
+
+def test_fuzzy_headers_end_to_end_extraction_without_llm():
+    class ExplodingProvider:
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            raise AssertionError("LLM fallback was unexpectedly invoked when fuzzy matching should have succeeded!")
+
+    client = httpx.Client(transport=httpx.MockTransport(ExplodingProvider()))
+    extractor = LLMExtractor(Settings(llm_base_url="http://llm.test/v1", llm_model="test-model"), client=client)
+
+    # Sheet where exact title matching fails (all titles have typos/synonyms not in standard titles)
+    # and arithmetic inference cannot resolve (single salary column 'Net Slary')
+    sheet = "Emplyee Name | Staff Ident | Net Slary\nAhmed Ali | E001 | 5,300\nSara Omar | E002 | 5,700"
+
+    layouts = MemoryLayouts()
+    # 1. First run: extracts via fuzzy header matching and caches layout
+    drafts = extractor.extract(sheet, layouts=layouts)
+    assert len(drafts) == 6
+    assert len(layouts.saved) == 1
+
+    by = by_field(drafts)
+    assert by[(0, "employee_name")].value == "Ahmed Ali"
+    assert by[(0, "employee_id")].value == "E001"
+    assert by[(0, "net_salary")].value == "5300"
+    assert by[(1, "employee_name")].value == "Sara Omar"
+    assert by[(1, "employee_id")].value == "E002"
+    assert by[(1, "net_salary")].value == "5700"
+
+    # 2. Second run: reuses cached layout without re-running matching or calling LLM
+    drafts2 = extractor.extract(sheet, layouts=layouts)
+    assert len(drafts2) == 6
+    assert layouts.uses == 1
+
+
+def test_fuzzy_headers_arabic_end_to_end_extraction_without_llm():
+    class ExplodingProvider:
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            raise AssertionError("LLM fallback was unexpectedly invoked when fuzzy matching should have succeeded!")
+
+    client = httpx.Client(transport=httpx.MockTransport(ExplodingProvider()))
+    extractor = LLMExtractor(Settings(llm_base_url="http://llm.test/v1", llm_model="test-model"), client=client)
+
+    sheet = "اسماء الموظفين | رقم العاملين | صافى المستحقين\nأحمد علي | E101 | 5300\nسارة عمر | E102 | 5700"
+    layouts = MemoryLayouts()
+
+    drafts = extractor.extract(sheet, layouts=layouts)
+    assert len(drafts) == 6
+    assert len(layouts.saved) == 1
+
+    by = by_field(drafts)
+    assert by[(0, "employee_name")].value == "أحمد علي"
+    assert by[(0, "employee_id")].value == "E101"
+    assert by[(0, "net_salary")].value == "5300"
+    assert by[(1, "employee_name")].value == "سارة عمر"
+    assert by[(1, "employee_id")].value == "E102"
+    assert by[(1, "net_salary")].value == "5700"
+
+
+# ---------------------------------------------------------------------- deterministic quality checks (M3 / R3)
+def test_arithmetic_discrepancy_flagged():
+    # 1. Valid record: basic (5000) + allowances (500) - deductions (200) = 5300 (no discrepancy)
+    valid_record = PayrollRecord(employee_name="Ahmed Ali", employee_id="E001", basic_salary=5000.0,
+                                 allowances=500.0, deductions=200.0, net_salary=5300.0)
+    assert check_arithmetic_discrepancy(valid_record, index=0) is None
+
+    # 2. Discrepant record: basic (5000) + allowances (500) - deductions (200) = 5300 != 6000
+    bad_record = PayrollRecord(employee_name="Sara Omar", employee_id="E002", basic_salary=5000.0,
+                               allowances=500.0, deductions=200.0, net_salary=6000.0)
+    warning = check_arithmetic_discrepancy(bad_record, index=1)
+    assert warning is not None
+    assert warning.warning_type == "arithmetic_discrepancy"
+    assert warning.record_index == 1
+    assert warning.field_name == "net_salary"
+    assert warning.details["expected"] == 5300.0
+    assert warning.details["actual"] == 6000.0
+    assert warning.details["discrepancy"] == 700.0
+
+    # 3. Confidence adjusted to 0.5 when arithmetic fails
+    source_text = "Sara Omar E002 5000 500 200 6000"
+    drafts = score_records([bad_record], source_text=source_text)
+    by = {d.field_name: d for d in drafts}
+    assert by["net_salary"].confidence == 0.5
+    assert by["basic_salary"].confidence == 0.5
+
+    # 4. Confidence is 0.95 when arithmetic holds
+    good_drafts = score_records([valid_record], source_text="Ahmed Ali E001 5000 500 200 5300")
+    by_good = {d.field_name: d for d in good_drafts}
+    assert by_good["net_salary"].confidence == 0.95
+
+    # 5. Tolerance boundary: diff 0.04 (<= 0.05) is accepted, diff 0.06 (> 0.05) is flagged
+    border_ok = PayrollRecord(basic_salary=5000.0, net_salary=5000.04)
+    assert check_arithmetic_discrepancy(border_ok, index=0, threshold=0.05) is None
+    border_bad = PayrollRecord(basic_salary=5000.0, net_salary=5000.06)
+    assert check_arithmetic_discrepancy(border_bad, index=0, threshold=0.05) is not None
+
+
+def test_duplicate_employee_ids():
+    records = [
+        PayrollRecord(employee_name="Ahmed Ali", employee_id="EMP-01", net_salary=5000.0),
+        PayrollRecord(employee_name="Sara Omar", employee_id="EMP-02", net_salary=6000.0),
+        PayrollRecord(employee_name="Tariq Aziz", employee_id="EMP-01", net_salary=5500.0),
+        PayrollRecord(employee_name="No ID Person", employee_id=None, net_salary=4000.0),
+        PayrollRecord(employee_name="Empty ID Person", employee_id="   ", net_salary=4500.0),
+    ]
+    warnings = check_duplicate_ids(records)
+    assert len(warnings) == 2
+    indices = {w.record_index for w in warnings}
+    assert indices == {0, 2}
+    for w in warnings:
+        assert w.warning_type == "duplicate_employee_id"
+        assert w.field_name == "employee_id"
+        assert w.details["employee_id"] == "EMP-01"
+        assert w.details["duplicate_indices"] == [0, 2]
+
+
+def test_outliers_negative_and_zero_basic():
+    records = [
+        PayrollRecord(employee_name="Normal Person", basic_salary=5000.0, net_salary=4800.0),
+        PayrollRecord(employee_name="Negative Net", basic_salary=3000.0, net_salary=-500.0),
+        PayrollRecord(employee_name="Zero Basic", basic_salary=0.0, net_salary=2000.0),
+        PayrollRecord(employee_name="Negative Basic", basic_salary=-100.0, net_salary=2000.0),
+    ]
+    warnings = check_salary_outliers(records)
+    types_by_index = {(w.record_index, w.warning_type) for w in warnings}
+    assert (1, "negative_net_salary") in types_by_index
+    assert (2, "non_positive_basic_salary") in types_by_index
+    assert (3, "non_positive_basic_salary") in types_by_index
+    assert not any(idx == 0 for idx, _ in types_by_index)
+
+
+def test_3_sigma_salary_outlier():
+    # 15 records: 14 normal (5000) and 1 extreme outlier (150,000)
+    normal_records = [
+        PayrollRecord(employee_name=f"Emp {i}", employee_id=f"E{i:03d}", basic_salary=5000.0, net_salary=5000.0)
+        for i in range(14)
+    ]
+    outlier_record = PayrollRecord(employee_name="Executive", employee_id="E999", basic_salary=150000.0, net_salary=150000.0)
+    batch = normal_records + [outlier_record]
+
+    warnings = check_salary_outliers(batch)
+    outlier_warnings = [w for w in warnings if w.warning_type == "salary_outlier"]
+    assert len(outlier_warnings) == 1
+    w = outlier_warnings[0]
+    assert w.record_index == 14
+    assert w.field_name == "net_salary"
+    assert w.details["value"] == 150000.0
+    assert w.details["z_score"] > 3.0
+
+    # Batch with N < 10 (e.g. 5 records) skips 3-sigma check to prevent false alarms
+    small_batch = [
+        PayrollRecord(employee_name="A", net_salary=4000.0),
+        PayrollRecord(employee_name="B", net_salary=4500.0),
+        PayrollRecord(employee_name="C", net_salary=5000.0),
+        PayrollRecord(employee_name="D", net_salary=5200.0),
+        PayrollRecord(employee_name="E", net_salary=15000.0),
+    ]
+    small_warnings = check_salary_outliers(small_batch)
+    assert not any(w.warning_type == "salary_outlier" for w in small_warnings)
+
+
+def test_run_deterministic_quality_checks_combined():
+    # Combined sheet with arithmetic mismatch, duplicate ID, and negative net salary
+    records = [
+        PayrollRecord(employee_name="Ahmed Ali", employee_id="E001", basic_salary=5000.0, allowances=500.0,
+                      deductions=200.0, net_salary=6000.0),  # arithmetic error
+        PayrollRecord(employee_name="Sara Omar", employee_id="E002", basic_salary=6000.0, net_salary=-200.0),  # negative net
+        PayrollRecord(employee_name="Tariq Aziz", employee_id="E001", basic_salary=5000.0, net_salary=5000.0),  # duplicate E001
+    ]
+    warnings = run_deterministic_quality_checks(records)
+    warning_types = [w.warning_type for w in warnings]
+    assert "arithmetic_discrepancy" in warning_types
+    assert "duplicate_employee_id" in warning_types
+    assert "negative_net_salary" in warning_types
+
+
+def test_extraction_output_schema_warnings():
+    # Schema exposes warnings array
+    schema = PayrollExtraction.model_json_schema()
+    assert "warnings" in schema["properties"]
+    assert "records" in schema["properties"]
+
+    # LLMExtractor.extract_payroll returns PayrollExtraction with warnings
+    client = httpx.Client(transport=httpx.MockTransport(Provider()))
+    extractor = LLMExtractor(Settings(llm_base_url="http://llm.test/v1", llm_model="test-model"), client=client)
+
+    sheet = ("Name | ID | Basic | Allowances | Deductions | Net\n"
+             "Ahmed Ali | E001 | 5000 | 500 | 200 | 6000\n"
+             "Sara Omar | E001 | 6000 | 0 | 300 | 5700")
+    extraction = extractor.extract_payroll(sheet)
+    assert isinstance(extraction, PayrollExtraction)
+    assert len(extraction.records) == 2
+    assert len(extraction.warnings) >= 2
+    types = {w.warning_type for w in extraction.warnings}
+    assert "arithmetic_discrepancy" in types
+    assert "duplicate_employee_id" in types

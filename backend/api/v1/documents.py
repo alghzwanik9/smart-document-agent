@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from core.schemas import (DocumentOut, DocumentPage, ExtractedFieldOut, FieldCorrection, UploadAccepted,
                           format_amount, parse_amount)
 from core.security import UploadRejected, require_api_key, safe_filename, validate_upload
-from database.models import Document, ExtractedField
+from database.models import CaseEvent, CaseRecord, Document, ExtractedField
 from document_processing import ProcessingError, parse_document
 from document_processing.exporter import ExportError, export_document
 from document_processing.llm_extractor import NUMERIC_FIELDS
@@ -159,6 +159,7 @@ def correct_field(document_id: int, field_id: int, body: FieldCorrection, reques
         if amount is None:
             raise HTTPException(status_code=422, detail=f"{field.field_name} must be a number")
         value = format_amount(amount)
+    old_val = field.corrected_value if field.is_corrected else field.original_value
     learning = request.app.state.learning
     if value == (field.original_value or ""):       # the original put back: nothing is corrected any more
         field.corrected_value, field.is_corrected = None, False
@@ -166,6 +167,24 @@ def correct_field(document_id: int, field_id: int, body: FieldCorrection, reques
     else:
         field.corrected_value, field.is_corrected = value, True
         learning.record(session, field)
+
+    # Rule 7 Append-Only Audit Trail: link to CaseRecord if document is associated with any case
+    linked_cases = session.scalars(select(CaseRecord).where(CaseRecord.document_id == document_id)).all()
+    for case in linked_cases:
+        event_count = session.scalar(
+            select(func.count()).select_from(CaseEvent).where(CaseEvent.case_id == case.case_id)
+        ) or 0
+        ev_id = f"EV-{event_count + 1:03d}"
+        session.add(CaseEvent(
+            case_id=case.case_id,
+            ev_id=ev_id,
+            event_type="FIELD_UPDATE",
+            description=f"Updated extracted field '{field.field_name}'",
+            old_value=str(old_val) if old_val is not None else None,
+            new_value=str(value) if value is not None else None,
+            reason=body.reason or "Document field correction",
+        ))
+
     session.commit()
     return field
 

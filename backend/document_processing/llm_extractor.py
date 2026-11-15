@@ -19,8 +19,9 @@ from core.schemas import (AMOUNT_FIELDS, PAYROLL_FIELDS, FieldDraft, LearnedCorr
                           PayrollRecord, format_amount)
 from document_processing import ProcessingError
 from document_processing.table_extractor import (Mapping, Table, arithmetic_holds, build_records, find_tables,
-                                                 fingerprint, infer_mapping_by_arithmetic, map_by_synonyms, plausible,
-                                                 sample, sufficient, valid_mapping)
+                                                 fingerprint, infer_mapping_by_arithmetic, map_by_fuzzy_headers,
+                                                 map_by_synonyms, plausible, run_deterministic_quality_checks,
+                                                 sample, sufficient, valid_mapping, validate_payroll_data)
 
 log = logging.getLogger("document_processing.llm_extractor")
 
@@ -95,12 +96,35 @@ class LLMExtractor:
         log.info("Extracted %s payroll records using %s earlier corrections", len(records), len(learned))
         return score_records(records, text, learned)
 
+    def extract_payroll(self, text: str, examples_for: Callable[[str], Sequence[LearnedCorrection]] | None = None,
+                        layouts=None) -> PayrollExtraction:
+        """Extracts records and populates deterministic data quality check warnings in PayrollExtraction."""
+        if self.settings.table_extraction:
+            try:
+                records = self._read_tables(text, layouts)
+            except _Unusable:
+                records = []
+            if records:
+                warnings = run_deterministic_quality_checks(records)
+                return PayrollExtraction(records=records, warnings=warnings)
+        if not self.settings.llm_configured:
+            raise ExtractionError("The LLM is not configured: set LLM_BASE_URL and LLM_MODEL")
+        records: list[PayrollRecord] = []
+        learned: list[LearnedCorrection] = []
+        for chunk in split_text(text, self.settings.llm_chunk_chars):
+            examples = list(examples_for(chunk)) if examples_for else []
+            learned.extend(examples)
+            chunk_extraction = self._extract_chunk(chunk, examples)
+            records.extend(chunk_extraction.records)
+        warnings = run_deterministic_quality_checks(records)
+        return PayrollExtraction(records=records, warnings=warnings)
+
     # ------------------------------------------------------------------ tables
     def _read_tables(self, text: str, layouts) -> list[PayrollRecord]:
         """The employees of every payroll table in the text. A table that holds no payroll is passed over; one that
         looks like payroll but cannot be read with confidence raises `_Unusable`, so no employee is silently dropped."""
         known: dict[str, tuple[Mapping | None, bool]] = {}
-        sources = {"titles": 0, "stored": 0, "arithmetic": 0, "model": 0}
+        sources = {"titles": 0, "stored": 0, "arithmetic": 0, "fuzzy": 0, "model": 0}
         records: list[PayrollRecord] = []
         for table in find_tables(text):
             key = fingerprint(table.header)
@@ -114,8 +138,8 @@ class LLMExtractor:
                 raise _Unusable
             records.extend(rows)
         if records:
-            log.info("Read %s payroll records from tables (layouts matched by titles: %s, stored: %s, arithmetic: %s, asked of the model: %s)",
-                     len(records), sources["titles"], sources["stored"], sources["arithmetic"], sources["model"])
+            log.info("Read %s payroll records from tables (layouts matched by titles: %s, stored: %s, arithmetic: %s, fuzzy: %s, asked of the model: %s)",
+                     len(records), sources["titles"], sources["stored"], sources["arithmetic"], sources.get("fuzzy", 0), sources["model"])
         return records
 
     def _column_mapping(self, table: Table, key: str, layouts, sources: dict) -> tuple[Mapping | None, bool]:
@@ -141,6 +165,14 @@ class LLMExtractor:
                 if layouts:
                     layouts.put(key, inferred)
                 return inferred, True
+        fuzzy = map_by_fuzzy_headers(table.header)
+        if sufficient(fuzzy):
+            fuzzy_rows = build_records(table, fuzzy)
+            if plausible(fuzzy_rows):
+                sources["fuzzy"] = sources.get("fuzzy", 0) + 1
+                if layouts:
+                    layouts.put(key, fuzzy)
+                return fuzzy, True
         asked = self._ask_columns(table)
         if asked is None or not sufficient(asked):
             return None, False
@@ -184,7 +216,10 @@ class LLMExtractor:
         ]
         reply = self._call(messages)
         try:
-            return _parse(reply)
+            parsed = _parse(reply)
+            if parsed.records and not parsed.warnings:
+                parsed.warnings = run_deterministic_quality_checks(parsed.records)
+            return parsed
         except (ValueError, ValidationError) as first:
             retry = messages + [
                 {"role": "assistant", "content": reply},
@@ -192,7 +227,10 @@ class LLMExtractor:
                                             "Reply again with the JSON object only."},
             ]
             try:
-                return _parse(self._call(retry))
+                parsed = _parse(self._call(retry))
+                if parsed.records and not parsed.warnings:
+                    parsed.warnings = run_deterministic_quality_checks(parsed.records)
+                return parsed
             except (ValueError, ValidationError) as second:
                 log.warning("LLM reply rejected twice: %s", _short(second))
                 raise ExtractionError("The LLM reply did not match the payroll schema after a retry") from second

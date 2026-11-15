@@ -23,6 +23,8 @@ navigation = st.navigation([
             url_path="Document_Details"),
     st.Page("views/2_Analytics.py", title=strings.NAV_ANALYTICS, icon=":material/monitoring:",
             url_path="Analytics"),
+    st.Page("views/3_Yahya_Intake.py", title="نظام يحيى الذكي للإدارة", icon=":material/account_tree:",
+            url_path="Yahya_Intake"),
 ])
 
 if not shared_client().has_key:

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from api.v1 import analytics, documents, feedback
+from api.v1 import analytics, documents, feedback, yahya_system
 from core.config import Settings, load_settings
 from database.connection import Database
 from document_processing.layout_store import LayoutStore
@@ -37,6 +37,7 @@ def create_app(settings: Settings | None = None, extractor=None, ocr_page=None, 
     app.include_router(documents.router)
     app.include_router(feedback.router)
     app.include_router(analytics.router)
+    app.include_router(yahya_system.router, prefix="/yahya")
 
     @app.get("/health")
     def health() -> dict:

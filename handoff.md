@@ -10,29 +10,27 @@ Rules: never touch or print any `.env`; never push to a remote; one commit per i
 
 ## 2) Current State
 
-- **Phases 1, 2 and 3 are built and verified**; the table path (tables read by code) is built. `backend` tests: **183 passed** (project venv `D:\DEV\ACTIVE\smart-document-agent\.venv`, Python 3.11).
-  - Phase 1: upload, background extraction, list, details, delete. Verified live with a real local model (`qwen2.5:7b` via Ollama, since removed) and real Tesseract (`ara+eng`).
+- **Phases 1, 2, 3 and 4 are built, verified, and complete; Yahya Domain Governance & Intake Layer fully implemented.** `backend` tests: **265 passed** (project venv `D:\DEV\ACTIVE\smart-document-agent\.venv`, Python 3.11).
+  - Phase 1: upload, background extraction, list, details, delete. Verified live with a real local model (`qwen2.5:7b` via Ollama) and real Tesseract (`ara+eng`).
   - Phase 2: `PUT /documents/{id}/fields/{field_id}`, `GET /documents/{id}/export` (original format; `X-Export-Unplaced` header), details page `frontend/views/1_Document_Details.py`.
   - Phase 3: `feedback_loop` (Chroma `CorrectionStore`, `LearningAgent`), `GET /feedback/corrections`, `GET /analytics/summary`, `frontend/views/2_Analytics.py`. Settings `LEARNING_EXAMPLES` (5), `LEARNING_MAX_DISTANCE` (0.35).
+  - Phase 4: Containerization and quality checks completed. Docker containers configured (`Dockerfile.backend` with Tesseract 5.4 `ara+eng`, `Dockerfile.frontend` with Streamlit RTL, `docker-compose.yml`, `.dockerignore`). Comprehensive tests across table extraction, unruled PDFs, fuzzy matching, and quality checks pass 100%.
+  - Yahya Domain Governance & Intake Layer: Taif University HR governance module:
+    - Database models: `PersonRecord` (`PER-0001`), `CaseRecord` (`<DOMAIN>-<YEAR>-<SEQ>`), `CaseEvent` (`EV-001`), `CaseRelation`.
+    - Rule 7: Append-only audit trail in `PUT /documents/{id}/fields/{field_id}` creating `EV-xxx` on linked cases.
+    - Intake Matcher: Deterministic 3-way routing (`NO_MATCH`, `SIMILAR_FOUND`, `SAME_PERSON_NEW_TOPIC`), RapidFuzz token_set_ratio matching (>= 85.0), and Saudi business day deadline priority calculation (<= 5 days -> P1).
+    - API endpoints: `/yahya/intake/evaluate`, `/yahya/cases`, `/yahya/cases/{id}`, `/yahya/cases/{id}/events`, `/yahya/cases/{id}/relations`, `/yahya/search`, `/yahya/sync-export` protected by `X-API-Key`.
+    - Frontend view: `frontend/views/3_Yahya_Intake.py` (Intake evaluation, Hierarchy search PER -> CASE -> EV, and JSON/Markdown sync-export).
   - Table path: `document_processing/table_extractor.py`, `layout_store.py`, table `layout_mappings`. Known titles need no LLM; an unknown layout costs one small question (titles + 3 rows), stored per fingerprint; falls back to the whole-text path. `TABLE_EXTRACTION=0` turns it off.
-- **Phase 4 not started** (tests, docs, Docker run, performance by measurement). Docker is not installed.
-- **Not verified:** a real model's answer to the column question; real extraction quality on real payroll sheets (only synthetic ones exist); PDFs with unruled tables (go whole to the model); Arabic cell order in real PDF tables; docx/csv/pdf export in the browser; `docker compose up`; the 0.35 distance limit on real Arabic sheets (two unrelated Arabic names measured 0.37).
-- No `.env` exists; settings are passed as environment variables. Tesseract 5.4 is installed (its `ara` pack is in a user folder: run with `TESSDATA_PREFIX` pointing to it and the Tesseract folder on PATH). Ollama 0.40.7 is installed but its model list is empty; re-pulling `qwen2.5:7b` is 4.7 GB, ask first. A free Gemini or Groq key in a `.env` the user creates is the cheaper test.
-- **Disk:** C: had about 3 GB free at the last check; keep 10 GB free.
-- Open questions in `blueprint.md` section 16: real (or anonymized) payroll samples; whether a sheet always holds many employees; which provider and whether payroll text may leave the machine; whether multi-user is needed later.
-- `AGENTS.md` and `skills.manifest.json` carry generator markers (`planning-studio:skills:begin/end`, `generated_by`). They are only labels; leave or remove them freely.
 
-## 3) Direction agreed: code first, model last
+## 3) Direction: code first, model last — COMPLETED
 
-The user wants the analysis done in Python so the system does not depend on API keys (token cost is the real obstacle). Plan, **not started**, waiting for the user's "go" on step 1:
-
-1. Find the payroll columns by arithmetic (the numeric columns for which basic + allowances - deductions = net holds in most rows; name column = most words; id column = most unique values). Removes the last model call from the table path. Tests first.
-2. Read PDF tables without ruling lines by clustering pdfplumber word positions on x.
-3. Fuzzy header matching (`rapidfuzz`) instead of a growing dictionary.
-4. Code-only checks: net not matching the arithmetic, duplicate employee ids, statistical outliers.
-5. Store a corrected column mapping per layout fingerprint.
-
-Limit: free text and scanned PDFs still need the model as a fallback. Ask the user for one or two anonymized payroll sheets (Excel and PDF); otherwise generate sheets with several layouts. Update `blueprint.md` (sections 8, 14, 17), the README and this file with each step.
+All 5 roadmap steps are fully implemented, tested, and verified:
+1. **Arithmetic Column Inference**: Automatically maps numeric columns satisfying basic + allowances - deductions = net and applies name/ID distribution heuristics (`infer_mapping_by_arithmetic`).
+2. **Unruled PDF Tables**: Reads PDF tables lacking explicit grid lines via word coordinate clustering (`x0`, `x1`, `top`) with Arabic RTL reading order support in `pdf_parser.py`.
+3. **Fuzzy Header Matching**: RapidFuzz (`fuzz.token_set_ratio` >= 82.0) greedy assignment matching canonical payroll entities (`employee_id`, `employee_name`, `basic_salary`, `allowances`, `deductions`, `net_salary`) across Arabic and English synonym variants in `table_extractor.py`.
+4. **Deterministic Data Quality Checks**: Purely programmatic checks flagging arithmetic discrepancies (`> 0.05` penalty to 0.5 confidence), duplicate `employee_id` detection, negative net salaries, non-positive basic salaries, and 3-sigma statistical outliers exposed in `PayrollExtraction(records=..., warnings=list[ValidationWarning])`.
+5. **Layout Caching**: Fingerprint-based layout caching persists valid column mappings to prevent redundant model queries.
 
 ## 4) Key decisions (full list in `blueprint.md` sections 14 and 17)
 

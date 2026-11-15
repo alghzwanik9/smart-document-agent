@@ -82,3 +82,90 @@ class LayoutMapping(Base):
     columns: Mapped[str] = mapped_column(Text, nullable=False)      # JSON list: a field name or null per column
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     use_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+# ---------------------------------------------------------------------- Yahya Intelligent Office System Models
+CASE_STATUSES = {"NEW", "ANL", "WAI", "RDY", "CLS", "HLD"}
+CASE_DOMAINS = {"PAY", "LEG", "AUD", "COR"}
+RELATION_TYPES = {"REL-PARENT", "REL-MERGED", "REL-RELATED", "REL-PRECEDENT", "REL-SAME-PERSON"}
+
+
+class PersonRecord(Base):
+    __tablename__ = "person_records"
+
+    per_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    employee_number: Mapped[str | None] = mapped_column(Text, index=True, nullable=True)
+    full_name: Mapped[str] = mapped_column(Text, index=True, nullable=False)
+    national_id_hash: Mapped[str | None] = mapped_column(Text, index=True, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+    cases: Mapped[list["CaseRecord"]] = relationship(back_populates="person", cascade="all, delete-orphan")
+
+
+class CaseRecord(Base):
+    __tablename__ = "case_records"
+
+    case_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    per_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("person_records.per_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    domain: Mapped[str] = mapped_column(Text, nullable=False, default="PAY", index=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="NEW", index=True)
+    priority: Mapped[str] = mapped_column(Text, nullable=False, default="P2")
+    statutory_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    close_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    document_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("documents.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    reference_number: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    monetary_amount: Mapped[float | None] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+    person: Mapped[PersonRecord] = relationship(back_populates="cases")
+    events: Mapped[list["CaseEvent"]] = relationship(
+        back_populates="case", cascade="all, delete-orphan", order_by="CaseEvent.id"
+    )
+    document: Mapped[Document | None] = relationship()
+    outgoing_relations: Mapped[list["CaseRelation"]] = relationship(
+        foreign_keys="CaseRelation.source_case_id", back_populates="source_case", cascade="all, delete-orphan"
+    )
+    incoming_relations: Mapped[list["CaseRelation"]] = relationship(
+        foreign_keys="CaseRelation.target_case_id", back_populates="target_case", cascade="all, delete-orphan"
+    )
+
+
+class CaseEvent(Base):
+    __tablename__ = "case_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    case_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("case_records.case_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    ev_id: Mapped[str] = mapped_column(Text, nullable=False)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    old_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    new_value: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+    case: Mapped[CaseRecord] = relationship(back_populates="events")
+
+
+class CaseRelation(Base):
+    __tablename__ = "case_relations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_case_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("case_records.case_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_case_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("case_records.case_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    relation_type: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+    source_case: Mapped[CaseRecord] = relationship(foreign_keys=[source_case_id], back_populates="outgoing_relations")
+    target_case: Mapped[CaseRecord] = relationship(foreign_keys=[target_case_id], back_populates="incoming_relations")
+

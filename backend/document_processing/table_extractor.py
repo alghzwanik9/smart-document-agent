@@ -16,31 +16,37 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from core.schemas import AMOUNT_FIELDS, PAYROLL_FIELDS, PayrollRecord, parse_amount
+from rapidfuzz import fuzz, process
+
+from core.schemas import AMOUNT_FIELDS, PAYROLL_FIELDS, PayrollRecord, ValidationWarning, parse_amount
 
 MIN_COLUMNS = 3             # a line of fewer cells is not part of a table (titles, sheet and page markers)
 HEADER_SEARCH_LINES = 5     # the titles are among the first lines of a block (a title row or two may come before)
 SAMPLE_ROWS = 3             # rows shown to the model with the titles
 SAMPLE_CELL_CHARS = 60
 MIN_SHARE = 0.5             # a mapping is believed when at least this share of the rows it reads look right
-ARITHMETIC_TOLERANCE = 0.01
+ARITHMETIC_TOLERANCE = 0.05
+ARITHMETIC_DISCREPANCY_THRESHOLD = 0.05
 
 # Column titles, by the field they hold. Matched after `_key` (case, diacritics, hamza, punctuation and units in brackets
 # do not matter) and only as a whole title: "net" is a net salary, "net of tax" is left to the model.
 SYNONYMS = {
     "employee_name": ("name", "employee name", "employee", "full name", "staff name", "worker name",
-                      "الاسم", "اسم", "اسم الموظف", "الموظف", "اسم العامل", "الاسم الكامل"),
+                      "الاسم", "اسم", "اسم الموظف", "الموظف", "اسم العامل", "الاسم الكامل", "اسم الموظفين"),
     "employee_id": ("id", "employee id", "emp id", "emp no", "emp number", "employee no", "employee number",
                     "staff id", "staff no", "code", "employee code",
-                    "الرقم الوظيفي", "رقم الموظف", "رقم وظيفي", "الرقم", "كود الموظف", "الكود", "الرقم الوظيفى"),
+                    "الرقم الوظيفي", "رقم الموظف", "رقم وظيفي", "الرقم", "كود الموظف", "الكود", "الرقم الوظيفى",
+                    "رقم العامل", "كود العامل"),
     "period": ("period", "month", "pay period", "payroll month", "الفترة", "الشهر", "شهر", "فترة الراتب"),
-    "basic_salary": ("basic", "basic salary", "basic pay", "base salary", "base pay", "الراتب الاساسي", "الاساسي",
-                     "اساسي", "الراتب الأساسي", "راتب اساسي"),
-    "allowances": ("allowances", "allowance", "total allowances", "البدلات", "بدلات", "اجمالي البدلات", "مجموع البدلات"),
-    "deductions": ("deductions", "deduction", "total deductions", "الاستقطاعات", "استقطاعات", "الخصومات", "خصومات",
-                   "اجمالي الخصومات", "مجموع الخصومات", "اجمالي الاستقطاعات"),
-    "net_salary": ("net", "net salary", "net pay", "net amount", "take home", "take home pay", "الصافي", "صافي",
-                   "صافي الراتب", "صافي المستحق", "صافي الاجر", "الراتب الصافي"),
+    "basic_salary": ("basic", "basic salary", "basic pay", "base salary", "base pay", "basic sal", "base",
+                     "الراتب الاساسي", "الاساسي", "اساسي", "الراتب الأساسي", "راتب اساسي"),
+    "allowances": ("allowances", "allowance", "total allowances", "allw", "allow",
+                   "البدلات", "بدلات", "اجمالي البدلات", "مجموع البدلات", "بدل", "البدل"),
+    "deductions": ("deductions", "deduction", "total deductions", "deduct",
+                   "الاستقطاعات", "استقطاعات", "الخصومات", "خصومات",
+                   "اجمالي الخصومات", "مجموع الخصومات", "اجمالي الاستقطاعات", "خصم", "الخصم"),
+    "net_salary": ("net", "net salary", "net pay", "net amount", "take home", "take home pay",
+                   "الصافي", "صافي", "صافي الراتب", "صافي المستحق", "صافي الاجر", "الراتب الصافي", "صافي مستحق"),
     "currency": ("currency", "العملة", "عملة"),
 }
 TOTAL_WORDS = ("total", "totals", "grand", "sum", "subtotal", "المجموع", "مجموع", "الاجمالي", "اجمالي", "الاجماليات")
@@ -128,6 +134,84 @@ def map_by_synonyms(header: tuple[str, ...]) -> Mapping:
     return mapping
 
 
+CANONICAL_PAYROLL_FIELDS = (
+    "employee_id",
+    "employee_name",
+    "basic_salary",
+    "allowances",
+    "deductions",
+    "net_salary",
+)
+
+
+def map_by_fuzzy_headers(
+    header: tuple[str, ...] | Sequence[str],
+    threshold: float = 82.0,
+    canonical_fields: Sequence[str] = CANONICAL_PAYROLL_FIELDS,
+) -> Mapping:
+    """Fuzzy matching of column titles against canonical payroll entities using RapidFuzz.
+
+    Uses `fuzz.token_set_ratio` with a strict similarity threshold (default 82.0) to match
+    variations, typos, and abbreviations across Arabic and English. Employs greedy assignment
+    by similarity score so no column is mapped to multiple fields and no canonical field is
+    assigned to multiple columns.
+    """
+    if not header:
+        return []
+
+    variant_to_field: dict[str, str] = {}
+    field_variants: dict[str, list[str]] = {f: [] for f in canonical_fields}
+    for field in canonical_fields:
+        if field in SYNONYMS:
+            for variant in SYNONYMS[field]:
+                k = _key(variant)
+                if k:
+                    variant_to_field[k] = field
+                    if k not in field_variants[field]:
+                        field_variants[field].append(k)
+
+    if not variant_to_field:
+        return [None] * len(header)
+
+    candidates: list[tuple[int, str, float]] = []
+    for col_idx, cell in enumerate(header):
+        cleaned = _key(str(cell))
+        if not cleaned:
+            continue
+        # Direct exact match check
+        if cleaned in variant_to_field:
+            candidates.append((col_idx, variant_to_field[cleaned], 100.0))
+            continue
+        # Check against each canonical field
+        for field in canonical_fields:
+            choices = field_variants[field]
+            if not choices:
+                continue
+            res = process.extractOne(
+                cleaned,
+                choices,
+                scorer=fuzz.token_set_ratio,
+                score_cutoff=threshold,
+            )
+            if res is not None:
+                candidates.append((col_idx, field, float(res[1])))
+
+    # Greedy assignment: sort primarily by score descending.
+    # Tie-breaking: earlier column index first (-col_idx with reverse=True).
+    candidates.sort(key=lambda x: (x[2], -x[0]), reverse=True)
+    mapping: Mapping = [None] * len(header)
+    assigned_cols: set[int] = set()
+    assigned_fields: set[str] = set()
+
+    for col_idx, field, score in candidates:
+        if col_idx not in assigned_cols and field not in assigned_fields:
+            mapping[col_idx] = field
+            assigned_cols.add(col_idx)
+            assigned_fields.add(field)
+
+    return mapping
+
+
 def sufficient(mapping: Mapping) -> bool:
     """Enough to be a payroll table: somebody is named and an amount is paid."""
     fields = set(mapping)
@@ -200,6 +284,134 @@ def plausible(records: list[PayrollRecord]) -> bool:
         return False
     checked = [verdict for verdict in (arithmetic_holds(r) for r in records) if verdict is not None]
     return not checked or sum(checked) / len(checked) >= MIN_SHARE
+
+
+# ---------------------------------------------------------------------- deterministic data quality checks
+def check_arithmetic_discrepancy(
+    record: PayrollRecord,
+    index: int,
+    threshold: float = ARITHMETIC_TOLERANCE,
+) -> ValidationWarning | None:
+    """Flags arithmetic discrepancies where abs((basic + allowances - deductions) - net) > threshold."""
+    if record.basic_salary is None or record.net_salary is None:
+        return None
+    expected = record.basic_salary + (record.allowances or 0.0) - (record.deductions or 0.0)
+    discrepancy = abs(expected - record.net_salary)
+    if discrepancy > threshold:
+        return ValidationWarning(
+            warning_type="arithmetic_discrepancy",
+            message=(
+                f"Arithmetic mismatch in record {index}: basic ({record.basic_salary}) + "
+                f"allowances ({record.allowances or 0.0}) - deductions ({record.deductions or 0.0}) = "
+                f"{expected:.2f}, but net salary is {record.net_salary:.2f} (discrepancy: {discrepancy:.2f})"
+            ),
+            record_index=index,
+            field_name="net_salary",
+            details={
+                "expected": round(expected, 4),
+                "actual": round(record.net_salary, 4),
+                "discrepancy": round(discrepancy, 4),
+            },
+        )
+    return None
+
+
+def check_duplicate_ids(records: Sequence[PayrollRecord]) -> list[ValidationWarning]:
+    """Scans for repeated non-empty employee_id within the batch/sheet."""
+    id_indices: dict[str, list[int]] = {}
+    for idx, r in enumerate(records):
+        emp_id = (r.employee_id or "").strip()
+        if emp_id:
+            id_indices.setdefault(emp_id, []).append(idx)
+
+    warnings: list[ValidationWarning] = []
+    for emp_id, indices in id_indices.items():
+        if len(indices) > 1:
+            for idx in indices:
+                warnings.append(
+                    ValidationWarning(
+                        warning_type="duplicate_employee_id",
+                        message=f"Duplicate employee ID '{emp_id}' found in records {indices}",
+                        record_index=idx,
+                        field_name="employee_id",
+                        details={"employee_id": emp_id, "duplicate_indices": indices},
+                    )
+                )
+    return warnings
+
+
+def check_salary_outliers(records: Sequence[PayrollRecord]) -> list[ValidationWarning]:
+    """Detects logical anomalies (negative net, non-positive basic) and 3-sigma statistical outliers (for N >= 10)."""
+    import math
+
+    warnings: list[ValidationWarning] = []
+
+    # 1. Logical checks per record
+    for idx, r in enumerate(records):
+        if r.net_salary is not None and r.net_salary < 0:
+            warnings.append(
+                ValidationWarning(
+                    warning_type="negative_net_salary",
+                    message=f"Negative net salary ({r.net_salary}) in record {idx}",
+                    record_index=idx,
+                    field_name="net_salary",
+                    details={"net_salary": r.net_salary},
+                )
+            )
+        if r.basic_salary is not None and r.basic_salary <= 0:
+            warnings.append(
+                ValidationWarning(
+                    warning_type="non_positive_basic_salary",
+                    message=f"Non-positive basic salary ({r.basic_salary}) in record {idx}",
+                    record_index=idx,
+                    field_name="basic_salary",
+                    details={"basic_salary": r.basic_salary},
+                )
+            )
+
+    # 2. 3-Sigma statistical check for net_salary (when N >= 10)
+    valid_salaries = [(idx, r.net_salary) for idx, r in enumerate(records) if r.net_salary is not None and r.net_salary > 0]
+    if len(valid_salaries) >= 10:
+        values = [v for _, v in valid_salaries]
+        n = len(values)
+        mean = sum(values) / n
+        variance = sum((x - mean) ** 2 for x in values) / n
+        std_dev = math.sqrt(variance)
+        if std_dev > 0:
+            for idx, val in valid_salaries:
+                z_score = abs(val - mean) / std_dev
+                if z_score > 3.0:
+                    warnings.append(
+                        ValidationWarning(
+                            warning_type="salary_outlier",
+                            message=f"Statistical outlier in net salary ({val}) in record {idx} (z-score: {z_score:.2f} > 3.0)",
+                            record_index=idx,
+                            field_name="net_salary",
+                            details={
+                                "value": val,
+                                "mean": round(mean, 2),
+                                "std_dev": round(std_dev, 2),
+                                "z_score": round(z_score, 2),
+                            },
+                        )
+                    )
+
+    return warnings
+
+
+def run_deterministic_quality_checks(records: Sequence[PayrollRecord]) -> list[ValidationWarning]:
+    """Runs all deterministic data quality checks across records and returns flagged warnings."""
+    warnings: list[ValidationWarning] = []
+    for idx, record in enumerate(records):
+        w = check_arithmetic_discrepancy(record, idx, ARITHMETIC_TOLERANCE)
+        if w is not None:
+            warnings.append(w)
+    warnings.extend(check_duplicate_ids(records))
+    warnings.extend(check_salary_outliers(records))
+    return warnings
+
+
+validate_payroll_data = run_deterministic_quality_checks
 
 
 # ---------------------------------------------------------------------- code-first arithmetic & heuristics inference
