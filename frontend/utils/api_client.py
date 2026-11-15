@@ -37,7 +37,17 @@ class ApiClient:
 
     @classmethod
     def from_environment(cls) -> "ApiClient":
-        return cls(os.environ.get("API_URL", DEFAULT_API_URL), os.environ.get("API_KEY", ""))
+        api_url = os.environ.get("API_URL", DEFAULT_API_URL)
+        api_key = os.environ.get("API_KEY", "")
+        if not api_key:
+            try:
+                import streamlit as st
+                api_key = st.secrets.get("API_KEY", "")
+            except Exception:
+                pass
+        api_key = api_key or "default-cloud-key"
+        _ensure_backend_running(api_url, api_key)
+        return cls(api_url, api_key)
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         try:
@@ -120,6 +130,44 @@ def _download_name(disposition: str) -> str:
         if part.startswith("filename*=UTF-8''"):
             return unquote(part[len("filename*=UTF-8''"):])
     return "export"
+
+
+def _ensure_backend_running(api_url: str, api_key: str) -> None:
+    """If deployed on Streamlit Cloud or standalone container where backend is local and not yet started,
+    spin up the FastAPI app in a background daemon thread."""
+    if "localhost" not in api_url and "127.0.0.1" not in api_url:
+        return
+    import threading, time, sys
+    from pathlib import Path
+    try:
+        with httpx.Client(timeout=1.0) as check_client:
+            res = check_client.get(f"{api_url.rstrip('/')}/health")
+            if res.status_code == 200:
+                return
+    except Exception:
+        pass
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    backend_dir = project_root / "backend"
+    if str(backend_dir) not in sys.path:
+        sys.path.insert(0, str(backend_dir))
+    try:
+        import uvicorn
+        from main import create_app
+        from core.config import Settings
+        
+        storage_dir = project_root / "storage"
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        settings = Settings(api_key=api_key, storage_dir=storage_dir)
+        app = create_app(settings)
+        port = int(api_url.split(":")[-1].split("/")[0]) if ":" in api_url else 8000
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        t = threading.Thread(target=server.run, daemon=True)
+        t.start()
+        time.sleep(2.0)
+    except Exception:
+        pass
 
 
 @lru_cache(maxsize=1)
