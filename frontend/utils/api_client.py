@@ -154,11 +154,23 @@ def _ensure_backend_running(api_url: str, api_key: str) -> None:
     try:
         import uvicorn
         from main import create_app
-        from core.config import Settings
+        from core.config import load_settings
         
+        try:
+            import streamlit as st
+            for k, v in st.secrets.items():
+                if isinstance(v, str) and k not in os.environ:
+                    os.environ[k] = v
+        except Exception:
+            pass
+
         storage_dir = project_root / "storage"
         storage_dir.mkdir(parents=True, exist_ok=True)
-        settings = Settings(api_key=api_key, storage_dir=storage_dir)
+        env = dict(os.environ)
+        if api_key and not env.get("API_KEY"):
+            env["API_KEY"] = api_key
+        env["STORAGE_DIR"] = str(storage_dir)
+        settings = load_settings(env)
         app = create_app(settings)
         port = int(api_url.split(":")[-1].split("/")[0]) if ":" in api_url else 8000
         config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
